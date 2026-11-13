@@ -1,8 +1,8 @@
 // Boat sandboxes (boat.dev) as bb machines.
 //
-// A new machine is a Boat box created from a named snapshot you prepare once (CLIs,
-// logins, caches, bb-app pre-installed, repos pre-cloned). bb's own bootstrap then
-// enrolls it. Everything slow lives in the snapshot, so create is: make box, bootstrap.
+// A new machine is a Boat sandbox, from Boat's stock image or a saved snapshot you
+// prepare (tools, logins, bb-app pre-installed, repos pre-cloned). bb's own bootstrap
+// then enrolls it. Put the slow work in the snapshot and create is: make sandbox, bootstrap.
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { Boat, boatExecutor } from "./boat.ts";
 
@@ -15,6 +15,8 @@ interface Config {
   boat: Boat;
   org: string;
   snapshot: string;
+  size: string;
+  environment: string;
   ttlSeconds: number;
   idleMinutes: number;
 }
@@ -31,13 +33,25 @@ const boxName = (key: string) => `bb ${key}`.slice(0, 120);
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     apiKey: { type: "string", label: "Boat API key", secret: true },
-    org: { type: "string", label: "Billing org", description: "Boat org id or name new boxes bill to." },
     snapshot: {
       type: "string",
-      label: "Base snapshot",
-      description: "Named Boat snapshot every new machine starts from.",
-      default: "bb-base",
+      label: "Saved snapshot",
+      description: "Saved Boat snapshot new machines start from. Empty uses Boat's stock image.",
+      default: "",
     },
+    size: {
+      type: "string",
+      label: "Size",
+      description: "small, default, large or xlarge. Empty uses the snapshot's size.",
+      default: "",
+    },
+    environment: {
+      type: "string",
+      label: "Boat environment",
+      description: "Boat environment with the repos and secrets to attach. Empty uses your default.",
+      default: "",
+    },
+    org: { type: "string", label: "Billing org", description: "Boat org id or name to bill. Empty uses your active wallet.", default: "" },
     ttlHours: { type: "number", label: "Boat auto-stop (hours)", description: "Extended automatically while the machine is in use.", default: 4 },
     idleMinutes: { type: "number", label: "Suspend after idle (minutes, 0 = never)", default: 15 },
   });
@@ -45,9 +59,15 @@ export default async function plugin(bb: BbPluginApi) {
   async function config(): Promise<Config | { error: string }> {
     const s = await settings.get();
     if (!s.apiKey) return { error: "Set the Boat API key in the plugin settings." };
-    if (!s.org) return { error: "Set the Boat billing org in the plugin settings." };
-    if (!s.snapshot) return { error: "Set the base snapshot in the plugin settings." };
-    return { boat: new Boat(s.apiKey), org: s.org, snapshot: s.snapshot, ttlSeconds: Math.round(s.ttlHours * 3600), idleMinutes: s.idleMinutes };
+    return {
+      boat: new Boat(s.apiKey),
+      org: s.org.trim(),
+      snapshot: s.snapshot.trim(),
+      size: s.size.trim(),
+      environment: s.environment.trim(),
+      ttlSeconds: Math.round(s.ttlHours * 3600),
+      idleMinutes: s.idleMinutes,
+    };
   }
   async function mustConfig() {
     const c = await config();
@@ -70,7 +90,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.experimental_machines.register({
     id: PROVIDER_ID,
     displayName: "Boat",
-    description: "Run threads on Boat sandboxes created from your base snapshot.",
+    description: "Run threads on Boat sandboxes.",
     icon: "./boat.svg",
     ephemeral: true,
     async availability() {
@@ -81,14 +101,22 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const c = await mustConfig();
         const t0 = Date.now();
-        report.step(`Creating a Boat box from ${c.snapshot}…`);
+        report.step(`Creating a Boat sandbox from ${c.snapshot || "the stock image"}…`);
         const box = await c.boat.create(
-          { from: c.snapshot, name: boxName(key), org: c.org, ttlSeconds: c.ttlSeconds, idempotencyKey: `${key}:${attempt}` },
+          {
+            name: boxName(key),
+            ttlSeconds: c.ttlSeconds,
+            idempotencyKey: `${key}:${attempt}`,
+            from: c.snapshot,
+            org: c.org,
+            type: c.size,
+            environment: c.environment,
+          },
           signal,
         );
         const resource: Resource = { boxId: box.id, key };
         await checkpoint({ ...resource });
-        report.log(`Boat box ${box.id} created in ${Math.round((Date.now() - t0) / 1000)} s`);
+        report.log(`Boat sandbox ${box.id} created in ${Math.round((Date.now() - t0) / 1000)} s`);
         await bootstrap(c.boat, resource, report, signal);
         report.log(`Ready in ${Math.round((Date.now() - t0) / 1000)} s`);
         return { status: "created", name: `Boat ${box.id}`, resource: { ...resource } };
@@ -100,7 +128,7 @@ export default async function plugin(bb: BbPluginApi) {
     async reconcileCleanup({ key, signal }) {
       try {
         const { boat } = await mustConfig();
-        for (const box of await boat.list(signal)) if (box.name === boxName(key)) await boat.delete(box.id, signal);
+        for (const box of await boat.findByName(boxName(key), signal)) await boat.delete(box.id, signal);
         return { status: "removed" };
       } catch (err) {
         signal.throwIfAborted();
@@ -110,7 +138,7 @@ export default async function plugin(bb: BbPluginApi) {
     async suspend({ resource, report, signal }) {
       const r = resource as unknown as Resource;
       const { boat } = await mustConfig();
-      report.step("Stopping the Boat box…");
+      report.step("Stopping the Boat sandbox…");
       await boat.stop(r.boxId, signal);
       await boat.waitFor(r.boxId, ["archived", "stopped"], signal);
       return { resource };
@@ -118,9 +146,9 @@ export default async function plugin(bb: BbPluginApi) {
     async resume({ resource, report, signal }) {
       const r = resource as unknown as Resource;
       const c = await mustConfig();
-      report.step("Resuming the Boat box…");
+      report.step("Resuming the Boat sandbox…");
       const box = await c.boat.get(r.boxId, signal);
-      if (box === null) throw new Error(`Boat box ${r.boxId} no longer exists`);
+      if (box === null) throw new Error(`Boat sandbox ${r.boxId} no longer exists`);
       if (!["ready", "idle", "running"].includes(box.state)) await c.boat.resume(r.boxId, c.ttlSeconds, signal);
       await bootstrap(c.boat, r, report, signal);
       return { resource };

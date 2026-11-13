@@ -1,15 +1,29 @@
 // Boat (boat.dev) REST client and a bb MachineExecutor over its commands API.
-// Only what the machine provider needs. Never log the API key or box URLs.
+// Only what the machine provider needs. Never log the API key or sandbox URLs.
 import { randomUUID } from "node:crypto";
 import type { MachineExecutor, MachineExecutorRequest } from "@get-bb/plugin-sdk";
 
-const BASE = "https://boat.dev/api/box/v1";
+const BASE = "https://boat.dev/api/v1";
 
-export interface Box {
+export interface Sandbox {
   id: string;
   name: string | null;
   state: string;
   archiveAfter: string | null;
+}
+
+export interface CreateRequest {
+  name: string;
+  ttlSeconds: number;
+  idempotencyKey: string;
+  /** Saved snapshot name; empty means Boat's stock image. */
+  from: string;
+  /** Billing org; empty means the API key's active wallet. */
+  org: string;
+  /** small, default, large or xlarge; empty inherits the snapshot's size. */
+  type: string;
+  /** Boat environment (repos, secrets); empty means the account default. */
+  environment: string;
 }
 
 export class BoatError extends Error {
@@ -22,7 +36,7 @@ export class BoatError extends Error {
   }
 }
 
-/** The box exists but can't run commands yet (starting or restoring). The command never ran. */
+/** The sandbox exists but can't run commands yet (starting or restoring). The command never ran. */
 function notReady(err: unknown): boolean {
   if (!(err instanceof BoatError)) return false;
   return /(box|sandbox)_(starting|restoring)|machine_not_running/i.test(`${err.code} ${err.message}`);
@@ -66,54 +80,57 @@ export class Boat {
     return json;
   }
 
-  private static box(json: Record<string, any>): Box {
-    const b = json.box ?? json.sandbox ?? json;
+  private static sandbox(json: Record<string, any>): Sandbox {
+    const b = json.sandbox ?? json;
     return { id: b.id, name: b.name ?? null, state: b.state, archiveAfter: b.archiveAfter ?? null };
   }
 
-  async get(id: string, signal?: AbortSignal): Promise<Box | null> {
+  async get(id: string, signal?: AbortSignal): Promise<Sandbox | null> {
     try {
-      return Boat.box(await this.call("GET", `/boxes/${id}`, undefined, {}, signal));
+      return Boat.sandbox(await this.call("GET", `/sandboxes/${id}`, undefined, {}, signal));
     } catch (err) {
       if (err instanceof BoatError && err.status === 404) return null;
       throw err;
     }
   }
 
-  async list(signal?: AbortSignal): Promise<Box[]> {
-    const out: Box[] = [];
+  /** Every sandbox with exactly this name. */
+  async findByName(name: string, signal?: AbortSignal): Promise<Sandbox[]> {
+    const out: Sandbox[] = [];
     let cursor = "";
     for (let page = 0; page < 20; page++) {
-      const json = await this.call("GET", `/boxes?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, undefined, {}, signal);
-      for (const b of json.boxes ?? json.sandboxes ?? []) out.push(Boat.box(b));
+      const q = `name=${encodeURIComponent(name)}&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const json = await this.call("GET", `/sandboxes?${q}`, undefined, {}, signal);
+      for (const b of json.sandboxes ?? []) out.push(Boat.sandbox(b));
       if (!json.pageInfo?.hasMore || !json.pageInfo?.nextCursor) break;
       cursor = json.pageInfo.nextCursor;
     }
     return out;
   }
 
-  /** Same idempotency key + body returns the same box for 24 h. */
-  async create(req: { from: string; name: string; org: string; ttlSeconds: number; idempotencyKey: string }, signal?: AbortSignal) {
-    const { idempotencyKey, ...body } = req;
-    return Boat.box(await this.call("POST", "/boxes", body, { "Idempotency-Key": idempotencyKey }, signal));
+  /** Same idempotency key + body returns the same sandbox for 24 h. Empty options are left to Boat's defaults. */
+  async create(req: CreateRequest, signal?: AbortSignal) {
+    const { idempotencyKey, ...rest } = req;
+    const body = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== ""));
+    return Boat.sandbox(await this.call("POST", "/sandboxes", body, { "Idempotency-Key": idempotencyKey }, signal));
   }
 
   async stop(id: string, signal?: AbortSignal) {
-    await this.call("POST", `/boxes/${id}/stop`, {}, {}, signal);
+    await this.call("POST", `/sandboxes/${id}/stop`, {}, {}, signal);
   }
 
   async resume(id: string, ttlSeconds: number, signal?: AbortSignal) {
-    await this.call("POST", `/boxes/${id}/resume`, { ttlSeconds }, {}, signal);
+    await this.call("POST", `/sandboxes/${id}/resume`, { ttlSeconds }, {}, signal);
   }
 
   async setTtl(id: string, ttlSeconds: number) {
-    await this.call("PATCH", `/boxes/${id}`, { ttlSeconds });
+    await this.call("PATCH", `/sandboxes/${id}`, { ttlSeconds });
   }
 
-  /** Delete and wait until the box is gone (GET returns 404). */
+  /** Delete and wait until the sandbox is gone (GET returns 404). */
   async delete(id: string, signal?: AbortSignal) {
     try {
-      await this.call("DELETE", `/boxes/${id}`, undefined, { "X-Ascii-Confirm-Delete": id }, signal);
+      await this.call("DELETE", `/sandboxes/${id}`, undefined, { "X-Ascii-Confirm-Delete": id }, signal);
     } catch (err) {
       if (err instanceof BoatError && err.status === 404) return;
       throw err;
@@ -122,25 +139,25 @@ export class Boat {
       if ((await this.get(id, signal)) === null) return;
       await sleep(3_000, signal);
     }
-    throw new Error(`Boat box ${id} still exists 3 minutes after delete`);
+    throw new Error(`Boat sandbox ${id} still exists 3 minutes after delete`);
   }
 
-  /** Wait until the box reaches one of `states`. */
+  /** Wait until the sandbox reaches one of `states`. */
   async waitFor(id: string, states: string[], signal: AbortSignal, maxMs = 10 * 60_000) {
     const end = Date.now() + maxMs;
     for (;;) {
       const box = await this.get(id, signal);
-      if (box === null) throw new Error(`Boat box ${id} is gone`);
+      if (box === null) throw new Error(`Boat sandbox ${id} is gone`);
       if (states.includes(box.state)) return box;
-      if (Date.now() > end) throw new Error(`Boat box ${id} is still ${box.state} after ${maxMs / 60_000} min`);
+      if (Date.now() > end) throw new Error(`Boat sandbox ${id} is still ${box.state} after ${maxMs / 60_000} min`);
       await sleep(2_000, signal);
     }
   }
 
-  /** Run a shell string as `user`, retrying while the box is still starting. Max 600 s. */
+  /** Run a shell string as `user`, retrying while the sandbox is still starting. Max 600 s. */
   async run(id: string, command: string, timeoutSeconds: number, signal: AbortSignal) {
     return this.whenReady(async () => {
-      const json = await this.call("POST", `/boxes/${id}/commands`, { command, timeoutSeconds }, {}, signal);
+      const json = await this.call("POST", `/sandboxes/${id}/commands`, { command, timeoutSeconds }, {}, signal);
       const r = json.command ?? json;
       return { exitCode: r.exitCode as number | null, stdout: (r.stdout ?? "") as string, stderr: (r.stderr ?? "") as string, timedOut: !!r.timedOut };
     }, signal);
@@ -148,7 +165,7 @@ export class Boat {
 
   async writeFile(id: string, path: string, content: string, signal: AbortSignal) {
     await this.whenReady(
-      () => this.call("PUT", `/boxes/${id}/files`, { path, content: Buffer.from(content).toString("base64"), encoding: "base64" }, {}, signal),
+      () => this.call("PUT", `/sandboxes/${id}/files`, { path, content: Buffer.from(content).toString("base64"), encoding: "base64" }, {}, signal),
       signal,
     );
   }
