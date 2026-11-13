@@ -28,6 +28,7 @@ For faster starts, make a saved snapshot (below).
 | `apiKey` | | Boat API key (secret) |
 | `snapshot` | stock image | Saved snapshot new machines start from |
 | `size` | snapshot's size | `small`, `default`, `large` or `xlarge` |
+| `projectSizes` | empty | Per-project size, e.g. `web-app=large, proj_abc=xlarge` (project name or id) |
 | `environment` | your default | Boat environment with the repos and secrets to attach |
 | `org` | active wallet | Boat org id or name to bill |
 | `ttlHours` | 4 | Boat auto-stop; extended while in use |

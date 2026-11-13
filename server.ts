@@ -16,6 +16,7 @@ interface Config {
   org: string;
   snapshot: string;
   size: string;
+  projectSizes: Map<string, string>;
   environment: string;
   ttlSeconds: number;
   idleMinutes: number;
@@ -28,6 +29,15 @@ interface Resource {
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 const isMachineBusy = (err: unknown) => err instanceof Error && "code" in err && err.code === "machine_busy";
+/** "a=large, b=xlarge" -> lowercase key -> size. */
+const parseProjectSizes = (raw: string) =>
+  new Map(
+    raw
+      .split(",")
+      .map((pair) => pair.split("=").map((x) => x.trim()))
+      .filter(([k, v]) => k && v)
+      .map(([k, v]) => [k.toLowerCase(), v] as [string, string]),
+  );
 const boxName = (key: string) => `bb ${key}`.slice(0, 120);
 
 export default async function plugin(bb: BbPluginApi) {
@@ -43,6 +53,12 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Size",
       description: "small, default, large or xlarge. Empty uses the snapshot's size.",
+      default: "",
+    },
+    projectSizes: {
+      type: "string",
+      label: "Size per project",
+      description: "Overrides Size for some projects. Comma-separated project=size, by project name or id, e.g. \"web-app=large, proj_abc=xlarge\".",
       default: "",
     },
     environment: {
@@ -64,6 +80,7 @@ export default async function plugin(bb: BbPluginApi) {
       org: s.org.trim(),
       snapshot: s.snapshot.trim(),
       size: s.size.trim(),
+      projectSizes: parseProjectSizes(s.projectSizes),
       environment: s.environment.trim(),
       ttlSeconds: Math.round(s.ttlHours * 3600),
       idleMinutes: s.idleMinutes,
@@ -73,6 +90,19 @@ export default async function plugin(bb: BbPluginApi) {
     const c = await config();
     if ("error" in c) throw new Error(c.error);
     return c;
+  }
+
+  /** Size for this machine: the thread's project override, else the default. Machine keys are thread ids. */
+  async function sizeFor(c: Config, key: string, signal: AbortSignal) {
+    if (c.projectSizes.size === 0 || !key.startsWith("thr_")) return c.size;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId: key, signal });
+      const project = await bb.sdk.projects.get({ projectId: thread.projectId, signal });
+      return c.projectSizes.get(project.id.toLowerCase()) ?? c.projectSizes.get(project.name.toLowerCase()) ?? c.size;
+    } catch (err) {
+      bb.log.warn(`Using the default size; could not read the project for ${key}: ${message(err)}`);
+      return c.size;
+    }
   }
 
   const idleKey = (hostId: string) => `idle/${hostId}`;
@@ -101,7 +131,8 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const c = await mustConfig();
         const t0 = Date.now();
-        report.step(`Creating a Boat sandbox from ${c.snapshot || "the stock image"}…`);
+        const size = await sizeFor(c, key, signal);
+        report.step(`Creating a ${size || "default"} Boat sandbox from ${c.snapshot || "the stock image"}…`);
         const box = await c.boat.create(
           {
             name: boxName(key),
@@ -109,7 +140,7 @@ export default async function plugin(bb: BbPluginApi) {
             idempotencyKey: `${key}:${attempt}`,
             from: c.snapshot,
             org: c.org,
-            type: c.size,
+            type: size,
             environment: c.environment,
           },
           signal,

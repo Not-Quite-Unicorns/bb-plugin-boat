@@ -15,6 +15,7 @@ bb creates a sandbox through the Boat API and runs its normal machine bootstrap 
 - **Boat API key**: required.
 - **Saved snapshot**: optional. Empty uses Boat's stock image.
 - **Size**, **Boat environment** and **Billing org**: optional.
+- **Size per project**: give heavy projects a bigger VM, e.g. `web-app=large`.
 - **Auto-stop** and **Suspend after idle**: how long machines live.
 
 ## Requirements
