@@ -14,8 +14,10 @@ const TTL_MARGIN_MS = 30 * MINUTE;
 // Boat exports environment variables only to login shells, through /run/ascii-secrets/env.sh.
 // The bb daemon runs as a systemd user service, so this drop-in sources the same file before
 // starting it. Skips when the drop-in exists or the sandbox has no Boat environment.
-const BOAT_ENV_DROP_IN = String.raw`set -e
-[ -r /run/ascii-secrets/env.sh ] || exit 0
+export const BOAT_ENV_DROP_IN = String.raw`set -e
+f=/run/ascii-secrets/env.sh
+[ -z "$BOAT_ENV_FILE" ] || f=$BOAT_ENV_FILE
+[ -r "$f" ] || exit 0
 u=$(cd ~/.config/systemd/user && ls bb-host-daemon-*.service | head -1)
 d=~/.config/systemd/user/$u.d
 [ -f "$d/10-boat-env.conf" ] && exit 0
@@ -25,12 +27,14 @@ mkdir -p "$d"
 cat > "$d/10-boat-env.conf" <<EOF
 [Service]
 ExecStart=
-ExecStart=/bin/bash -c ". /run/ascii-secrets/env.sh 2>/dev/null; exec \"\$\$0\" \"\$\$@\"" $orig
+ExecStart=/bin/bash -c ". $f 2>/dev/null; exec \"\$\$0\" \"\$\$@\"" $orig
 EOF
 systemctl --user daemon-reload
 systemctl --user restart "$u"
 echo restarted
 `;
+/** How long to wait for the daemon after the drop-in restarts it. Tests shorten it. */
+export const reconnect = { delayMs: 5_000, intervalMs: 3_000, attempts: 40 };
 
 interface Config {
   boat: Boat;
@@ -148,12 +152,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (!out.stdout.includes("restarted")) return;
     report.step("Restarting the bb daemon with the Boat environment…");
-    await sleep(5_000, signal);
-    for (let i = 0; i < 40; i++) {
+    await sleep(reconnect.delayMs, signal);
+    for (let i = 0; i < reconnect.attempts; i++) {
       if ((await bb.sdk.hosts.get({ hostId })).status === "connected") return;
-      await sleep(3_000, signal);
+      await sleep(reconnect.intervalMs, signal);
     }
-    report.log("Warning: the bb daemon did not reconnect within two minutes of the restart");
+    report.log("Warning: the bb daemon did not reconnect after the restart");
   }
 
   async function bootstrap(c: Config, r: Resource, report: Report, signal: AbortSignal) {

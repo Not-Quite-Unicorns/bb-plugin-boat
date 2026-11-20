@@ -23,6 +23,7 @@
   "description": "Boat sandboxes (boat.dev) as bb machines.",
   "scripts": {
     "typecheck": "tsc --noEmit -p .",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
     "build": "bb plugin build"
   },
   "license": "MIT",
