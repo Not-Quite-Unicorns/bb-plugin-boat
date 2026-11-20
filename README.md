@@ -14,7 +14,9 @@ For faster starts, make a saved snapshot (below).
 
 ## How it works
 
-- **Create:** `POST /sandboxes`, then bb's own bootstrap installs and enrolls the bb daemon.
+- **Create:** `POST /sandboxes`, runs the optional setup command, then bb's own bootstrap installs
+  and enrolls the bb daemon. A systemd drop-in makes the daemon source the Boat environment's
+  variables, so threads see them.
 - **Suspend / resume:** Boat stop / resume. Resume re-runs the bootstrap, which is a no-op
   when the daemon is already installed.
 - **Remove:** deletes the sandbox.
@@ -30,6 +32,7 @@ For faster starts, make a saved snapshot (below).
 | `size` | snapshot's size | `small`, `default`, `large` or `xlarge` |
 | `projectSizes` | empty | Per-project size, e.g. `web-app=large, proj_abc=xlarge` (project name or id) |
 | `environment` | your default | Boat environment with the repos and secrets to attach |
+| `setupCommand` | empty | Shell command run in a login shell before bb connects, on create and resume |
 | `org` | active wallet | Boat org id or name to bill |
 | `ttlHours` | 4 | Boat auto-stop; extended while in use |
 | `idleMinutes` | 15 | Suspend after this long idle; 0 = never |
@@ -39,7 +42,19 @@ For faster starts, make a saved snapshot (below).
 Keep tokens out of the snapshot. Two places work:
 
 - `bb machine env set NAME` (value on stdin) gives every bb machine's threads the variable.
-- A Boat environment (`environment` setting) attaches its secrets to each sandbox.
+- A Boat environment (`environment` setting) attaches its secrets to each sandbox. Boat exports
+  its variables only to login shells, through `/run/ascii-secrets/env.sh`; the plugin adds a
+  systemd drop-in so the bb daemon, and every thread it starts, sources the same file. After
+  `boat env upgrade`, a running machine picks up new values when it is suspended and resumed.
+
+## Setup command
+
+Boat runs an environment's repository setup script on create, resume and fork, but skips it
+when the snapshot already holds the repository. Set `setupCommand` to run it anyway, for
+example `bash ~/.config/my-env/bootstrap.sh`. It runs as `user` in a login shell, with the
+environment's variables and secret files in place, before bb connects. It must be safe to
+run again, since resume runs it too. A non-zero exit fails the create or resume. Boat limits
+it to 10 minutes.
 
 ## Faster starts: a saved snapshot
 

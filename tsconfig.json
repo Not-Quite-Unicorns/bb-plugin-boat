@@ -17,6 +17,7 @@
   },
   "include": [
     "server.ts",
-    "boat.ts"
+    "boat.ts",
+    "test/*.ts"
   ]
 }
