@@ -4,12 +4,33 @@
 // prepare (tools, logins, bb-app pre-installed, repos pre-cloned). bb's own bootstrap
 // then enrolls it. Put the slow work in the snapshot and create is: make sandbox, bootstrap.
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { Boat, boatExecutor } from "./boat.ts";
+import { Boat, boatExecutor, lastLine, runScript, sleep } from "./boat.ts";
 
 const PROVIDER_ID = "boat";
 const MINUTE = 60_000;
 /** Extend Boat's auto-stop when it is closer than this. */
 const TTL_MARGIN_MS = 30 * MINUTE;
+
+// Boat exports environment variables only to login shells, through /run/ascii-secrets/env.sh.
+// The bb daemon runs as a systemd user service, so this drop-in sources the same file before
+// starting it. Skips when the drop-in exists or the sandbox has no Boat environment.
+const BOAT_ENV_DROP_IN = String.raw`set -e
+[ -r /run/ascii-secrets/env.sh ] || exit 0
+u=$(cd ~/.config/systemd/user && ls bb-host-daemon-*.service | head -1)
+d=~/.config/systemd/user/$u.d
+[ -f "$d/10-boat-env.conf" ] && exit 0
+orig=$(systemctl --user show "$u" -p ExecStart --value | sed -nE 's/.*argv\[\]=([^;]*) ;.*/\1/p' | sed -E 's/ +$//')
+[ -n "$orig" ]
+mkdir -p "$d"
+cat > "$d/10-boat-env.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=/bin/bash -c ". /run/ascii-secrets/env.sh 2>/dev/null; exec \"\$\$0\" \"\$\$@\"" $orig
+EOF
+systemctl --user daemon-reload
+systemctl --user restart "$u"
+echo restarted
+`;
 
 interface Config {
   boat: Boat;
@@ -18,6 +39,7 @@ interface Config {
   size: string;
   projectSizes: Map<string, string>;
   environment: string;
+  setupCommand: string;
   ttlSeconds: number;
   idleMinutes: number;
 }
@@ -67,6 +89,13 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Boat environment with the repos and secrets to attach. Empty uses your default.",
       default: "",
     },
+    setupCommand: {
+      type: "string",
+      label: "Setup command",
+      description:
+        "Shell command run in a login shell on the sandbox before bb connects, on create and on resume. Boat skips the environment's repository setup script when the snapshot already holds the repository; put that script here. Must be safe to run again. Max 10 minutes.",
+      default: "",
+    },
     org: { type: "string", label: "Billing org", description: "Boat org id or name to bill. Empty uses your active wallet.", default: "" },
     ttlHours: { type: "number", label: "Boat auto-stop (hours)", description: "Extended automatically while the machine is in use.", default: 4 },
     idleMinutes: { type: "number", label: "Suspend after idle (minutes, 0 = never)", default: 15 },
@@ -82,6 +111,7 @@ export default async function plugin(bb: BbPluginApi) {
       size: s.size.trim(),
       projectSizes: parseProjectSizes(s.projectSizes),
       environment: s.environment.trim(),
+      setupCommand: s.setupCommand.trim(),
       ttlSeconds: Math.round(s.ttlHours * 3600),
       idleMinutes: s.idleMinutes,
     };
@@ -108,11 +138,36 @@ export default async function plugin(bb: BbPluginApi) {
   const idleKey = (hostId: string) => `idle/${hostId}`;
   const bump = (hostId: string) => bb.storage.kv.set(idleKey(hostId), Date.now());
 
-  async function bootstrap(boat: Boat, r: Resource, report: { step(t: string): void; log(t: string): void }, signal: AbortSignal) {
+  type Report = { step(t: string): void; log(t: string): void };
+
+  async function passBoatEnvironment(boat: Boat, r: Resource, hostId: string, report: Report, signal: AbortSignal) {
+    const out = await runScript(boat, r.boxId, BOAT_ENV_DROP_IN, signal);
+    if (out.exitCode !== 0) {
+      report.log(`Warning: the bb daemon will not see the Boat environment's variables: ${lastLine(out)}`);
+      return;
+    }
+    if (!out.stdout.includes("restarted")) return;
+    report.step("Restarting the bb daemon with the Boat environment…");
+    await sleep(5_000, signal);
+    for (let i = 0; i < 40; i++) {
+      if ((await bb.sdk.hosts.get({ hostId })).status === "connected") return;
+      await sleep(3_000, signal);
+    }
+    report.log("Warning: the bb daemon did not reconnect within two minutes of the restart");
+  }
+
+  async function bootstrap(c: Config, r: Resource, report: Report, signal: AbortSignal) {
     const t0 = Date.now();
+    if (c.setupCommand) {
+      report.step("Running the setup command…");
+      const out = await runScript(c.boat, r.boxId, c.setupCommand, signal);
+      if (out.exitCode !== 0) throw new Error(`Setup command failed (exit ${out.exitCode}): ${lastLine(out)}`);
+      report.log(`Setup command finished in ${Math.round((Date.now() - t0) / 1000)} s`);
+    }
     report.step("Connecting the bb daemon…");
-    const { hostId } = await bb.experimental_machines.bootstrap({ key: r.key, executor: boatExecutor(boat, r.boxId), report, signal });
+    const { hostId } = await bb.experimental_machines.bootstrap({ key: r.key, executor: boatExecutor(c.boat, r.boxId), report, signal });
     report.log(`Daemon connected in ${Math.round((Date.now() - t0) / 1000)} s`);
+    await passBoatEnvironment(c.boat, r, hostId, report, signal);
     await bump(hostId);
     return hostId;
   }
@@ -148,7 +203,7 @@ export default async function plugin(bb: BbPluginApi) {
         const resource: Resource = { boxId: box.id, key };
         await checkpoint({ ...resource });
         report.log(`Boat sandbox ${box.id} created in ${Math.round((Date.now() - t0) / 1000)} s`);
-        await bootstrap(c.boat, resource, report, signal);
+        await bootstrap(c, resource, report, signal);
         report.log(`Ready in ${Math.round((Date.now() - t0) / 1000)} s`);
         return { status: "created", name: `Boat ${box.id}`, resource: { ...resource } };
       } catch (err) {
@@ -181,7 +236,7 @@ export default async function plugin(bb: BbPluginApi) {
       const box = await c.boat.get(r.boxId, signal);
       if (box === null) throw new Error(`Boat sandbox ${r.boxId} no longer exists`);
       if (!["ready", "idle", "running"].includes(box.state)) await c.boat.resume(r.boxId, c.ttlSeconds, signal);
-      await bootstrap(c.boat, r, report, signal);
+      await bootstrap(c, r, report, signal);
       return { resource };
     },
     async remove({ hostId, resource, signal }) {

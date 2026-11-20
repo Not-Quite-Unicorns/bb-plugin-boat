@@ -42,7 +42,7 @@ function notReady(err: unknown): boolean {
   return /(box|sandbox)_(starting|restoring)|machine_not_running/i.test(`${err.code} ${err.message}`);
 }
 
-const sleep = (ms: number, signal?: AbortSignal) =>
+export const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     const t = setTimeout(resolve, ms);
     signal?.addEventListener("abort", () => (clearTimeout(t), reject(signal.reason)), { once: true });
@@ -184,6 +184,18 @@ export class Boat {
 }
 
 const quote = (argv: string[]) => argv.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`)).join(" ");
+const USER_ENV = "export HOME=/home/user XDG_RUNTIME_DIR=/run/user/$(id -u); cd /home/user;";
+
+/** Run a bash script as `user` in a login shell, so the Boat environment's variables apply. Max 600 s. */
+export async function runScript(boat: Boat, boxId: string, script: string, signal: AbortSignal) {
+  const f = `/tmp/bb-script-${randomUUID()}.sh`;
+  await boat.writeFile(boxId, f, script, signal);
+  const r = await boat.run(boxId, `${USER_ENV} bash -l ${f} </dev/null; rc=$?; rm -f ${f}; exit $rc`, 600, signal);
+  return { ...r, exitCode: r.timedOut ? 124 : (r.exitCode ?? 1) };
+}
+
+export const lastLine = (r: { stdout: string; stderr: string }) =>
+  (r.stderr.trim() || r.stdout.trim()).split("\n").pop()?.slice(0, 300) ?? "";
 
 /**
  * bb's bootstrap runs argv + stdin through this. Boat runs one shell string with an
@@ -193,7 +205,7 @@ const quote = (argv: string[]) => argv.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? 
 export function boatExecutor(boat: Boat, boxId: string): MachineExecutor {
   return {
     async exec(req: MachineExecutorRequest) {
-      const env = "export HOME=/home/user XDG_RUNTIME_DIR=/run/user/$(id -u); cd /home/user;";
+      const env = USER_ENV;
       let command = `${env} ${quote(req.command)} </dev/null`;
       if (req.stdin.length > 0) {
         const f = `/tmp/bb-stdin-${randomUUID()}`;
